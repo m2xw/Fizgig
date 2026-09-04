@@ -157,11 +157,26 @@ def setup_parser() -> argparse.ArgumentParser:
                         "the full model. '20-49' is the measured likeness recipe — photo "
                         "gradients into the front trunk erode rendering and anatomy while "
                         "identity lives in the back blocks. Composes with --train_blocks.")
-    p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
+    p.add_argument("--audio_blocks", default=None, metavar="SPEC",
+                   help="Voice routing: audio-only training steps update only these DiT "
+                        "blocks (the refiner always trains). '34-49' is the measured voice "
+                        "zone (core 38-48 + shoulder) — audio gradients outside it "
+                        "measurably corrupt the visual blocks (A/B, 24 Aug). Applies "
+                        "under the rotation fine-tune, and in LoRA mode alongside "
+                        "--photo_blocks.")
+    p.add_argument("--clip_blocks", default=None, metavar="SPEC",
+                   help="Fine-tune only: confine VIDEO CLIP training steps to these DiT "
+                        "blocks (the refiner always trains). The GUI's 'Restrict video to "
+                        "likeness blocks' passes the likeness set here — a confined "
+                        "overnight video run trained perfectly well (field, 29 Aug). "
+                        "Unset: clips train the full model, the original behaviour.")
+    p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4", "hqq"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
                         "does. 'nf4' decodes then 4-bit quantizes (~9.5%% error, ~11 GB). "
-                        "'auto' picks int8 for a pre-quantized file, nf4 otherwise.")
+                        "'hqq' decodes then HQQ 4-bit quantizes (~4.8%% error, ~15 GB; NF4's speed on "
+                        "streamed plans, ~half on a big card at swap 0). 'auto' picks int8 for a pre-quantized "
+                        "file, nf4 otherwise — never hqq.")
     p.add_argument("--no_quantize", action="store_true",
                    help="Train on the bf16 base (no NF4) — needs ~66 GB VRAM.")
     p.add_argument("--blocks_to_swap", default="auto",
@@ -211,6 +226,17 @@ def setup_parser() -> argparse.ArgumentParser:
                         "training step. Pair with --sample_steps 6.")
     p.add_argument("--turbo_lora_strength", type=float, default=0.75,
                    help="Preview strength for --turbo_lora_path (0.75 recommended)")
+    p.add_argument("--context_lora_path", default=None,
+                   help="Context LoRA: an existing H3 LoRA loaded FROZEN and ACTIVE under the "
+                        "trainable one, in training and previews. The output is trained to be "
+                        "paired with it at inference. Not available with --finetune_rotation.")
+    p.add_argument("--context_lora_strength", type=float, default=1.0,
+                   help="Strength the context LoRA rides at (0.0-2.0)")
+    p.add_argument("--training_adapter_path", default=None,
+                   help="Training adapter (Ostris, ostris/minimax_h3_training_adapter): a frozen "
+                        "LoRA at 1.0 that de-distills the base while yours learns — on for every "
+                        "training step, off for previews. Use the fl2va or ref2va file to match "
+                        "--dit. Not available with --finetune_rotation.")
     p.add_argument("--sample_audio", action="store_true",
                    help="Clip previews carry their generated SOUND: the jointly-denoised "
                         "audio rows are decoded to a .wav beside each sample. Needs "
@@ -228,6 +254,45 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--metadata_license", default=None)
     p.add_argument("--metadata_tags", default=None)
     p.add_argument("--metadata_trigger_phrase", default=None)
+    # ---- rotation full fine-tune (trains the BASE, not a LoRA) ----
+    p.add_argument("--finetune_rotation", type=int, default=0,
+                   help="Master switch: >0 trains the base model itself in component "
+                        "windows. The output is a full ~21 GB int8 checkpoint per save.")
+    p.add_argument("--finetune_rotate_every", type=int, default=1,
+                   help="Advance the window every N epochs")
+    p.add_argument("--finetune_rotation_mode", default="component",
+                   choices=["component"],
+                   help="component (the only mode) trains one "
+                        "matmul (qkv/out/fc1/fc2) across EVERY block per window, on an "
+                        "NF4-resident base — full model depth each epoch; the saved "
+                        "checkpoint is still exact int8.")
+    p.add_argument("--finetune_start_window", type=int, default=0,
+                   help="Continue a fine-tune mid-cycle (printed at every save)")
+    p.add_argument("--finetune_fused_backward", action="store_true", default=True,
+                   help="Free each gradient as it lands (per-tensor optimizers; "
+                        "disables grad clipping and accumulation)")
+    p.add_argument("--no_finetune_fused_backward", dest="finetune_fused_backward",
+                   action="store_false")
+    p.add_argument("--finetune_scope", default="all", choices=["all", "photo"],
+                   help="photo = skip clip/voice batches; all = the full mixed regime")
+    p.add_argument("--finetune_blocks", default=None,
+                   help="Restrict the rotation cycle to a block spec (e.g. '20-49', "
+                        "the likeness recipe) — shrinks the CPU master too")
+    p.add_argument("--finetune_master", default="auto", choices=["auto", "ram", "disk"],
+                   help="Where the bf16 master lives. ram = whole master resident "
+                        "(field-proven, ~0.77 GB/block). disk = lazy reads from the int8 "
+                        "file + trained tensors spilled to scratch, ~one tensor in RAM — "
+                        "what fits full-model FT on 64 GB boxes. auto picks disk when the "
+                        "master would eat over 40%% of available RAM.")
+    p.add_argument("--finetune_scratch_dir", default=None,
+                   help="disk master's spill directory (wants a fast local drive). "
+                        "Default: beside the dataset caches.")
+    p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
+                   help="Fine-tune only: LR multiplier for images in a dataset block marked "
+                        "`is_reg = true`. They anchor the model's prior rather than teaching "
+                        "a subject, so they train as a nudge (0.1-0.3). They follow the photo "
+                        "routing and stop with the visual category. Ignored when no reg block "
+                        "is present; ignored (with a warning) on LoRA runs.")
     return p
 
 
@@ -274,6 +339,8 @@ def main():
         include_patterns=args.include_patterns,
         train_blocks=args.train_blocks,
         photo_blocks=args.photo_blocks,
+        clip_blocks=args.clip_blocks,
+        audio_blocks=args.audio_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
         distill_phase1_epochs=args.distill_phase1_epochs,
@@ -313,8 +380,21 @@ def main():
         sample_seed=args.sample_seed,
         turbo_lora_path=args.turbo_lora_path,
         turbo_lora_strength=args.turbo_lora_strength,
+        context_lora_path=args.context_lora_path,
+        context_lora_strength=args.context_lora_strength,
+        training_adapter_path=args.training_adapter_path,
         sample_audio=args.sample_audio,
         audio_vae_path=args.audio_vae,
+        finetune_rotation=args.finetune_rotation,
+        finetune_rotate_every=args.finetune_rotate_every,
+        finetune_rotation_mode=args.finetune_rotation_mode,
+        finetune_start_window=args.finetune_start_window,
+        finetune_fused_backward=args.finetune_fused_backward,
+        finetune_scope=args.finetune_scope,
+        finetune_blocks=args.finetune_blocks,
+        finetune_master=args.finetune_master,
+        finetune_scratch_dir=args.finetune_scratch_dir,
+        reg_lr_multiplier=args.reg_lr_multiplier,
     )
 
 
