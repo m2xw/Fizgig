@@ -35,6 +35,4 @@ jobs:
           # Passes the image version argument declared in the Dockerfile (ARG FIZGIG_IMAGE_VERSION)
           build-args: |
             FIZGIG_IMAGE_VERSION=${{ github.sha }}
-          tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/fizgig:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/fizgig:${{ github.ref_name }}
+          tags: mm2xdock/fizgig:latest
