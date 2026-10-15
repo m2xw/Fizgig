@@ -31,6 +31,43 @@ from fizgig.training.metadata import (ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def decode_caption(raw: bytes, caption_path: str) -> str:
+    """Decode a caption file's bytes, tolerating encodings other than UTF-8.
+
+    Captions written by the Captions tab are UTF-8, but datasets assembled elsewhere
+    routinely carry Windows-1252 text — one curly apostrophe (0x92) in one file out of a
+    hundred used to abort the whole caching run with a bare UnicodeDecodeError deep in a
+    worker thread that named no file at all.
+
+    Order: UTF-16 if there's a BOM (Notepad's "Unicode" save), then UTF-8 (BOM tolerated),
+    then cp1252, then latin-1 — which maps every byte and so cannot fail. Anything past
+    UTF-8 is logged with the path, so a genuinely mis-encoded caption is still visible
+    instead of being silently mangled into the training data.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            text = raw.decode("utf-16")
+            logger.warning("Caption %s is UTF-16 — decoded, but re-save it as UTF-8.", caption_path)
+            return text
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue  # cp1252 leaves a handful of bytes undefined; latin-1 won't.
+        logger.warning("Caption %s is not valid UTF-8 — decoded as %s. Re-save it as UTF-8 to "
+                       "silence this warning.", caption_path, encoding)
+        return text
+    logger.warning("Caption %s could not be decoded in any known encoding — undecodable bytes "
+                   "replaced.", caption_path)
+    return raw.decode("utf-8", errors="replace")
 logging.basicConfig(level=logging.INFO)
 
 
@@ -92,6 +129,16 @@ BUCKET_RESO_STEPS = {ARCHITECTURE_MINIMAX: 32}
 LATENT_SPATIAL_FACTOR = {"klein9b": 16, "krea2": 8, ARCHITECTURE_MINIMAX: 16}
 
 
+def _described_family(architecture):
+    """A family added through the standard layer (fizgig.families), or None. The tables above keep serving
+    Klein / Krea 2 / H3; described families carry their own bucket step and latent factor."""
+    try:
+        from fizgig.families.registry import by_arch_id
+        return by_arch_id(architecture)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -137,7 +184,17 @@ def glob_images(directory: str, base: str = "*", caption_extension: Optional[str
     if caption_extension is not None:
         caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
         caption_bases = {os.path.splitext(os.path.basename(p))[0] for p in caption_paths}
+        skipped = sorted(os.path.basename(p) for p in img_paths
+                         if os.path.splitext(os.path.basename(p))[0] not in caption_bases)
         img_paths = [p for p in img_paths if os.path.splitext(os.path.basename(p))[0] in caption_bases]
+        if skipped:
+            # Say so, loudly: a clip or photo with no caption is left out of the run, and a
+            # dataset can lose all its clips this way without anyone noticing (a Reddit user's
+            # Gizmo segments, 17 Sep 2026). Files renamed after captioning are the usual cause.
+            shown = ", ".join(skipped[:8]) + (f", … {len(skipped) - 8} more" if len(skipped) > 8 else "")
+            logger.warning(f"[dataset] {len(skipped)} file(s) in {directory} have no {caption_extension} "
+                           f"caption and are LEFT OUT of training: {shown} — caption them (the Captions "
+                           f"tab does clips from their middle frame) or move them out of the folder")
 
     img_paths.sort()
     return img_paths
@@ -445,6 +502,20 @@ class BucketBatchManager:
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
+            if getattr(item_info, "still_only", False):
+                # the clip's still item: the cached sharpest-face frame when the cache pass
+                # made one, else frame 0 sliced from the clip latent [C, T, H, W] -> [C, H, W]
+                # (frame 0 of a causal VAE encodes pixel frame 0 alone). No sound either way.
+                if "still_latent" in sd_latent:
+                    _st = sd_latent["still_latent"]
+                    sd_latent = {f"latent_{_st.shape[1]}x{_st.shape[2]}": _st.contiguous()}
+                else:
+                    sd_latent = {k: (v[:, 0].contiguous() if (k.startswith("latent_") and v.dim() == 4) else v)
+                                 for k, v in sd_latent.items()
+                                 if k not in ("audio_latent", "audio_only")}
+            else:
+                # the clip itself never carries its still keys into the batch
+                sd_latent = {k: v for k, v in sd_latent.items() if k not in ("still_latent", "still_frame")}
             sd = {**sd_latent, **sd_te}
             # MiniMax H3 reference distillation only: sibling `..._teref{N}.safetensors` files
             # hold the TEACHER's conditioning (caption + a `<Picture 1>` vision block), its
@@ -486,6 +557,9 @@ class BucketBatchManager:
                 elif key in ("hidden_states", "attention_mask"):
                     # Krea 2 text cache: multi-layer Qwen3-VL stack + validity mask
                     content_key = key
+                elif key.startswith("cond__"):
+                    # standard-layer families (fizgig.families): the driver's own conditioning keys, verbatim
+                    content_key = key
                 else:
                     # Fallback: strip dtype suffix for compatibility with any
                     # legacy keys that might exist in merged caches
@@ -521,24 +595,34 @@ class BucketBatchManager:
 class ImageDirectoryDatasource:
     """Loads images (and optional control images) from a directory on disk."""
 
+    # A job that never trains (the RefMod plain encode) has no use for captions: with this set
+    # on the CLASS before the dataset is built, every image is taken whether or not a caption
+    # file sits beside it, and a missing caption reads as "". Training paths leave it False —
+    # there the caption filter is what keeps an uncaptioned stray out of the run.
+    captions_optional: bool = False
+
     def __init__(
         self,
         image_directory: str,
         caption_extension: Optional[str] = None,
         control_directory: Optional[str] = None,
         extra_extensions: tuple = (),
+        family=None,
     ):
         self.image_directory = image_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory
         self.extra_extensions = tuple(extra_extensions)
+        # the FamilyDescription whose clips these are (its clip_spec checks and decodes them); None = stills only
+        self.family = family
         self.caption_only = False
         self.has_control = False
         self._current_idx = 0
 
         logger.info(f"glob images in {self.image_directory}")
         self.image_paths = glob_images(self.image_directory,
-                                       caption_extension=self.caption_extension,
+                                       caption_extension=(None if self.captions_optional
+                                                          else self.caption_extension),
                                        extra_extensions=self.extra_extensions)
         _clips = sum(1 for p in self.image_paths
                      if os.path.splitext(p)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS})
@@ -585,19 +669,21 @@ class ImageDirectoryDatasource:
             self.control_paths: dict[str, list[str]] = {}
 
             sorted_by_len = sorted(self.image_paths, key=lambda p: len(os.path.basename(p)), reverse=True)
-            all_ctrl = set(glob_images(self.control_directory))
+            # a dataset that globs clips (H3) pairs a clip with a clip: a clip-pair slider's other pole
+            _vid = tuple(e for e in self.extra_extensions if e in VIDEO_EXTENSIONS)
+            all_ctrl = set(glob_images(self.control_directory, extra_extensions=_vid))
 
             for img_path in sorted_by_len:
-                base_no_ext = os.path.splitext(os.path.basename(img_path))[0]
+                base_no_ext = os.path.splitext(os.path.basename(img_path))[0].casefold()   # IMG_1 pairs with img_1
                 matches = [
                     p for p in all_ctrl
-                    if os.path.basename(p).startswith(base_no_ext + ".")
-                    or os.path.basename(p).startswith(base_no_ext + "_")
+                    if os.path.basename(p).casefold().startswith(base_no_ext + ".")
+                    or os.path.basename(p).casefold().startswith(base_no_ext + "_")
                 ]
                 all_ctrl.difference_update(matches)
                 if matches:
                     def _sort_key(path, _base=base_no_ext):
-                        bn = os.path.splitext(os.path.basename(path))[0]
+                        bn = os.path.splitext(os.path.basename(path))[0].casefold()
                         if bn == _base:
                             return 0
                         suffix = bn.rsplit("_", 1)[-1]
@@ -633,15 +719,31 @@ class ImageDirectoryDatasource:
             return image_path, [Image.new("RGB", AUDIO_SENTINEL_RESO)], caption, None
         if os.path.splitext(image_path)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS}:
             # A clip arrives as its frames, which the resize step downstream already handles as a
-            # list. Imported lazily and only inside this branch: the dataset layer stays free of
-            # model imports at load time, and only MiniMax datasets ever glob a video in the
-            # first place.
-            from fizgig.minimax.clip import read_frames, validate
-            frames = read_frames(image_path)
-            validate(image_path, frames=len(frames))
+            # list. Checked against the family's ClipSpec; only a family whose media include clips
+            # ever globs one.
+            from fizgig.families import clips
+            spec = self.family.clip_spec
+            frames = clips.read_frames(image_path)
+            clips.validate(image_path, spec, self.family.display_name, frames=len(frames))
             imgs = [Image.fromarray(f) for f in frames]
             _, caption = self.get_caption(idx)
-            return image_path, imgs, caption, None
+            controls = None
+            if self.has_control:
+                # a clip-pair slider: the other pole is a clip (any length - an edit may drop frames), its frames the
+                # controls
+                cps = self.control_paths[image_path]
+                if len(cps) != 1 or os.path.splitext(cps[0])[1].lower() not in {e.lower() for e in VIDEO_EXTENSIONS}:
+                    raise ValueError(f"{os.path.basename(image_path)}: a clip pairs with exactly one clip of the same "
+                                     f"name in the second folder (found: {[os.path.basename(p) for p in cps]})")
+                # the VAE encodes the family's frame grid only: an edit that dropped frames is held on its last
+                # frame up to the next length it can encode
+                pf, n_before = clips.hold_to_grid(clips.read_frames(cps[0]), spec)
+                if len(pf) != n_before:
+                    logger.info(f"[slider] {os.path.basename(cps[0])}: {n_before} frames -> {len(pf)} (last frame held;"
+                                f" {self.family.display_name} encodes "
+                                f"{', '.join(str(g) for g in clips.grid_frames(spec)[:4])} ... frames)")
+                controls = [Image.fromarray(f) for f in pf]
+            return image_path, imgs, caption, controls
 
         img = Image.open(image_path)
         if img.mode not in ("RGB", "RGBA"):
@@ -663,9 +765,11 @@ class ImageDirectoryDatasource:
     def get_caption(self, idx: int) -> Tuple[str, str]:
         image_path = self.image_paths[idx]
         caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
-        return image_path, caption
+        if self.captions_optional and not (caption_path and os.path.isfile(caption_path)):
+            return image_path, ""
+        with open(caption_path, "rb") as f:
+            raw = f.read()
+        return image_path, decode_caption(raw, caption_path).strip()
 
     def __iter__(self):
         self._current_idx = 0
@@ -693,6 +797,15 @@ class ImageDirectoryDatasource:
 class ImageDataset(torch.utils.data.Dataset):
     """Klein 9B image dataset with bucketing, caching, and batch management."""
 
+    # MiniMax H3 only (Peter, 7 Sep 2026): every cached CLIP also contributes ONE FRAME as a
+    # photo item — its own step, the clip's own text encoding. The frame is the clip's
+    # sharpest one that shows a face, picked and encoded at cache time (--clip_still) and
+    # stored in the clip's own cache file as `still_latent`. A clip cached without one falls
+    # back to frame 0 sliced from the clip latent (H3's causal VAE makes that slice the
+    # still's own encoding). Set on the CLASS by the trainer before the dataset group is
+    # generated (the blueprint path builds and prepares the datasets in one go).
+    clip_still_as_photo: bool = False
+
     def __init__(
         self,
         resolution: Tuple[int, int],
@@ -707,9 +820,13 @@ class ImageDataset(torch.utils.data.Dataset):
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_KLEIN_9B,
         is_reg: bool = False,
+        clip_megapixels: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
+        # Clip Target Megapixels (MiniMax H3): a clip is cached and trained at this size or
+        # smaller, so photos can train at 1 MP beside clips at a size that caches and trains fast.
+        self.clip_megapixels = float(clip_megapixels) if clip_megapixels else None
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.batch_size = batch_size
@@ -724,7 +841,8 @@ class ImageDataset(torch.utils.data.Dataset):
         # Regularisation set: a prior anchor, not a subject. The trainer trains it at a fixed
         # reduced LR and keeps the per-image loss watch off it.
         self.is_reg = is_reg
-        self.reso_steps = BUCKET_RESO_STEPS.get(architecture, RESOLUTION_STEPS)
+        _fam = None if architecture in BUCKET_RESO_STEPS else _described_family(architecture)
+        self.reso_steps = _fam.bucket_step if _fam else BUCKET_RESO_STEPS.get(architecture, RESOLUTION_STEPS)
 
         self.seed: Optional[int] = None
         self.current_epoch = 0
@@ -734,15 +852,19 @@ class ImageDataset(torch.utils.data.Dataset):
         if image_directory is None:
             raise ValueError("image_directory must be specified")
 
-        # Only MiniMax H3 can train on clips and voice recordings, so only its datasets glob for
+        # Clips and voice recordings are globbed only for a family whose description's media include
         # them. Kept on the dataset as well as handed to the datasource, because
         # prepare_for_training re-derives what counts as a training item when it cross-checks
         # the cache — and if the two answers disagree, every clip's cache is discarded as an
         # orphan and the run trains on nothing.
-        _extra = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS if architecture == ARCHITECTURE_MINIMAX else ()
+        self.family = _described_family(architecture)
+        _media = tuple(getattr(self.family, "media", ()) or ())
+        _extra = ((VIDEO_EXTENSIONS if "clip" in _media else ()) +
+                  (AUDIO_EXTENSIONS if "voice" in _media else ()))
         self.extra_extensions = _extra
         self.datasource = ImageDirectoryDatasource(image_directory, caption_extension,
-                                                   control_directory, extra_extensions=_extra)
+                                                   control_directory, extra_extensions=_extra,
+                                                   family=self.family)
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
@@ -780,6 +902,18 @@ class ImageDataset(torch.utils.data.Dataset):
     def get_all_text_encoder_output_cache_files(self) -> list[str]:
         return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}_te.safetensors"))
 
+    def _clip_target_bucket(self, image_size, bucket_reso):
+        """A clip's bucket: at Clip Target Megapixels when it is set (its own bucket grid, the way
+        Target Megapixels sizes the photos), else the photos' bucket. The same answer at caching
+        and at training, so the cache matches exactly and --skip_existing keeps it."""
+        if not self.clip_megapixels:
+            return bucket_reso
+        if getattr(self, "_clip_selector", None) is None:
+            side = int(math.sqrt(self.clip_megapixels * 1e6)) // 16 * 16
+            self._clip_selector = BucketSelector((side, side), self.enable_bucket, self.bucket_no_upscale,
+                                                 self.reso_steps)
+        return self._clip_selector.get_bucket_resolution(image_size)
+
     def _plan_clip_bucket(self, bucket_reso, image_key):
         """Cap a clip's bucket to what the VAE can actually encode in the free VRAM.
 
@@ -799,8 +933,9 @@ class ImageDataset(torch.utils.data.Dataset):
         if not self._clip_free_gb:
             return bucket_reso                       # CPU, or no way to ask — leave it alone
 
-        from fizgig.minimax.vae import MiniMaxH3VideoVAEEncoder
-        planned = MiniMaxH3VideoVAEEncoder.plan_clip_bucket(self._clip_free_gb, *bucket_reso)
+        if getattr(self, "_clip_driver", None) is None:
+            self._clip_driver = self.family.load_driver()
+        planned = self._clip_driver.clip_bucket_cap(self._clip_free_gb, *bucket_reso)
         if tuple(planned) != tuple(bucket_reso) and image_key not in self._clip_capped:
             self._clip_capped.add(image_key)
             logger.warning(
@@ -900,7 +1035,8 @@ class ImageDataset(torch.utils.data.Dataset):
                 # their clips. Cap the clip rather than fail the run: the stills are unaffected,
                 # and a clip at a size that fits is worth more than a crash at one that does not.
                 if len(images) > 1:
-                    bucket_reso = self._plan_clip_bucket(bucket_reso, image_key)
+                    bucket_reso = self._plan_clip_bucket(self._clip_target_bucket(image_size, bucket_reso),
+                                                         image_key)
                 resized = [resize_image_to_bucket(img, bucket_reso) for img in images]
 
                 resized_controls = None
@@ -999,6 +1135,9 @@ class ImageDataset(torch.utils.data.Dataset):
         """
         factor = LATENT_SPATIAL_FACTOR.get(architecture)
         if factor is None:
+            _fam = _described_family(architecture)
+            factor = _fam.spatial_factor if _fam else None
+        if factor is None:
             return None
         try:
             from safetensors import safe_open
@@ -1072,6 +1211,8 @@ class ImageDataset(torch.utils.data.Dataset):
         skipped_stale = 0
         skipped_wrong_reso = 0
         accepted_smaller_clips = 0
+        still_items = 0
+        still_frame0_fallback = 0
 
         bucketed: dict[Tuple, list[ItemInfo]] = {}   # (w, h), or ("audio", w, h) for voice items
         for cache_file in latent_cache_files:
@@ -1101,6 +1242,8 @@ class ImageDataset(torch.utils.data.Dataset):
                 bucket_key: Tuple = ("audio",) + AUDIO_SENTINEL_RESO
             else:
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
+                if self.clip_megapixels and self.latent_cache_frames(cache_file) > 1:
+                    bucket_reso = self._clip_target_bucket(image_size, bucket_reso)
                 # A cache written at a different Target Megapixels has the SAME filename (it
                 # encodes the original size, not the bucket) — training on it would silently run
                 # at the old resolution. Skip it and tell the user to re-run cache preparation.
@@ -1125,6 +1268,20 @@ class ImageDataset(torch.utils.data.Dataset):
             bucket = bucketed.get(bucket_key, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
+            # A clip's still as a photo of its own (see the class attribute): a derived item
+            # sharing both cache files, resolved in __getitem__. Voice items (audio sentinel
+            # bucket) never qualify; a still (3-D latent) is left alone.
+            if (self.clip_still_as_photo and bucket_key != ("audio",) + AUDIO_SENTINEL_RESO
+                    and self.latent_cache_frames(cache_file) > 1):
+                ff = ItemInfo(item_key + "#still", "", image_size, bucket_reso,
+                              latent_cache_path=cache_file)
+                ff.text_encoder_output_cache_path = te_cache
+                ff.still_only = True
+                for _ in range(self.num_repeats):
+                    bucket.append(ff)
+                still_items += self.num_repeats
+                if not self.latent_cache_has_still(cache_file):
+                    still_frame0_fallback += 1
             bucketed[bucket_key] = bucket
 
         if skipped_stale:
@@ -1144,9 +1301,44 @@ class ImageDataset(torch.utils.data.Dataset):
                 f"training them at the cached size. Re-running cache preparation with more "
                 f"free VRAM re-encodes them at full size.")
 
+        if still_items:
+            logger.info(
+                f"[dataset] {still_items} clip still(s) added as photo items — each clip's "
+                f"sharpest frame with a face trains as a still on its own step, with the "
+                f"clip's caption.")
+            if still_frame0_fallback:
+                logger.warning(
+                    f"[dataset] {still_frame0_fallback} clip(s) were cached without a picked "
+                    f"still — their frame 0 is used instead. Re-run caching with the tick on "
+                    f"(or flush the cache) to pick sharp frames for them.")
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
         self.num_train_items = sum(len(b) for b in bucketed.values())
+
+    @staticmethod
+    def latent_cache_has_still(cache_file: str) -> bool:
+        """Whether a cached clip carries its picked still (`still_latent`), from the header."""
+        try:
+            from safetensors import safe_open
+            with safe_open(cache_file, framework="pt") as f:
+                return "still_latent" in f.keys()
+        except Exception:
+            return False
+
+    @staticmethod
+    def latent_cache_frames(cache_file: str) -> int:
+        """Latent frames in a cached item, from the header alone (1 for a still or on any
+        trouble reading)."""
+        try:
+            from safetensors import safe_open
+            with safe_open(cache_file, framework="pt") as f:
+                for k in f.keys():
+                    if k.startswith("latent_") and not k.startswith("latent_control_"):
+                        shape = f.get_slice(k).get_shape()
+                        return int(shape[1]) if len(shape) == 4 else 1
+        except Exception:
+            pass
+        return 1
 
     # -- epoch / seed management -------------------------------------------
 

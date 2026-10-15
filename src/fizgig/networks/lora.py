@@ -90,9 +90,15 @@ class LoRAModule(torch.nn.Module):
             for lora_up in self.lora_up:
                 torch.nn.init.zeros_(lora_up.weight)
 
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
-        alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
+        if isinstance(alpha, torch.Tensor):
+            # A plain Python float, not a NumPy scalar: a NumPy scalar attribute traces as a
+            # tensor under torch.compile, so the inference epilogue's add(alpha=float(scale))
+            # became a data-dependent guard and Krea 2 + compile + a context LoRA crashed at the
+            # first step (GuardOnDataDependentSymNode, 13 Sep 2026). .item() keeps bf16 safe.
+            alpha = float(alpha.detach().float().item())
+        elif alpha is not None:
+            alpha = float(alpha)
+        alpha = float(self.lora_dim) if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
 
@@ -272,14 +278,22 @@ class LoRAInfModule(LoRAModule):
         return weight
 
     def default_forward(self, x):
+        # Inference only (the training class above is untouched): the epilogue is ONE
+        # add with a scalar alpha instead of two bf16 multiplies and an add — three
+        # elementwise kernels over [tokens, out] per module became one. On the H3 Repair
+        # Studio that is ~1,000 module forwards per Dial render (measured 4 Sep: ~0.4 s of
+        # a 3.8 s move). Same maths; multiplier x scale is formed once in fp32.
         if self.split_dims is None:
             lx = self.lora_down(x)
             lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            lx = torch.cat(lxs, dim=-1)
+        m = self.multiplier
+        if isinstance(m, torch.Tensor):                    # a tensor multiplier keeps the old path
+            return self.org_forward(x) + lx * m * self.scale
+        return torch.add(self.org_forward(x), lx, alpha=float(m) * float(self.scale))
 
     def compute_delta(self, x: torch.Tensor) -> torch.Tensor:
         """Return just the LoRA contribution (base output NOT added) for a given
@@ -1186,7 +1200,7 @@ class LoRANetwork(torch.nn.Module):
             # at the end of an epoch that is the moment RAM is tightest, and on constrained
             # boxes it raised MemoryError (or a safetensors-rust PanicException) BEFORE the
             # checkpoint was written, killing the run over optional indexing metadata
-            # (#92, diagnosed by David Maybank on a 12 GB / 64 GB box). Optional metadata
+            # (#92, diagnosed by @mabseyuk on a 12 GB / 64 GB box). Optional metadata
             # must never cost a checkpoint: on those two failures, skip the hashes and save;
             # anything else is a real bug and still raises.
             try:
@@ -1634,6 +1648,33 @@ def _convert_diffusers_flux_lora(weights_sd: Dict[str, torch.Tensor]) -> Dict[st
     return converted
 
 
+def _peft_normalize(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Two PEFT export quirks, straightened before conversion:
+      - the adapter name left in the key (PEFT's own state dict): blocks.0.attn.qkv_proj.lora_A.default.weight
+        -> blocks.0.attn.qkv_proj.lora_A.weight
+      - a module saved twice, once under diffusion_model. / transformer. and once bare: the prefixed one is kept (both
+        map to the same module, and a file seen in the wild held DIFFERENT weights under the bare copy)."""
+    import re
+    pat = re.compile(r"\.(lora_[AB])\.(?!weight$)[^.]+\.weight$")
+    out: Dict[str, torch.Tensor] = {}
+    renamed = 0
+    for k, v in weights_sd.items():
+        nk = pat.sub(lambda m: f".{m.group(1)}.weight", k)
+        renamed += nk != k
+        out[nk] = v
+    if renamed:
+        logger.info(f"[peft→kohya] {renamed} keys carried a PEFT adapter name (lora_A.<name>.weight) - read as lora_A/B")
+    prefixed = {k[len(p):] for k in out for p in ("diffusion_model.", "transformer.") if k.startswith(p)}
+    dup = [k for k in out if k in prefixed]
+    if dup:
+        mods = {k.rsplit(".lora_", 1)[0].rsplit(".alpha", 1)[0] for k in dup}
+        logger.warning(f"[peft→kohya] {len(mods)} module(s) are in the file twice, prefixed and bare (e.g. "
+                       f"{sorted(mods)[0]}) - the prefixed copy is used, the bare one ignored")
+        for k in dup:
+            del out[k]
+    return out
+
+
 def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Convert a PEFT/diffusers-format LoRA (or LyCORIS-prefixed LoKR/LoHa) state
     dict to Fizgig/kohya module-name convention.
@@ -1659,6 +1700,7 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
       - `transformer.`     (AI-Toolkit, OneTrainer OMI format)
       - `lora_transformer_` (OneTrainer legacy-diffusers format — dots already flattened)
     """
+    weights_sd = _peft_normalize(weights_sd)
     # Check for diffusers-style Flux keys (transformer_blocks / single_transformer_blocks)
     # These need full key remapping + QKV fusion, not just prefix stripping.
     # Checked FIRST: Krea 2 and Flux both say `transformer_blocks.` in diffusers form, and the

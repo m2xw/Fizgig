@@ -27,6 +27,49 @@ from .gpu_backend import is_rocm
 logger = logging.getLogger(__name__)
 
 
+# torch major.minor -> the triton major.minor releases it is known to work with (the
+# version the Linux torch wheel depends on, and the one before it, which the field has
+# proven). A triton built for a newer torch imports fine and then fails or hangs INSIDE
+# torch.compile, so an import check alone lets it through — that is how a fresh install
+# with an unpinned triton-windows 3.8 on torch 2.10 stalled Krea 2 previews with no log.
+_TRITON_FOR_TORCH = {
+    "2.8": ("3.3", "3.4"),
+    "2.9": ("3.4", "3.5"),
+    "2.10": ("3.5", "3.6"),
+    "2.11": ("3.6", "3.7"),
+    "2.12": ("3.7", "3.8"),
+}
+
+
+def _major_minor(v: str) -> str:
+    parts = str(v or "").split("+")[0].split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else str(v or "")
+
+
+def triton_matches_torch(triton_version=None, torch_version=None):
+    """(ok, note): whether this triton is one torch is known to work with. Unknown torch
+    versions are not gated (ok, ""). Versions default to the installed ones."""
+    try:
+        if torch_version is None:
+            import torch as _t
+            torch_version = _t.__version__
+        if triton_version is None:
+            import triton as _tr
+            triton_version = getattr(_tr, "__version__", "")
+    except Exception:
+        return True, ""
+    want = _TRITON_FOR_TORCH.get(_major_minor(torch_version))
+    if not want:
+        return True, ""
+    have = _major_minor(triton_version)
+    if have in want:
+        return True, ""
+    return False, (f"triton {triton_version} does not pair with torch {torch_version} "
+                   f"(torch {_major_minor(torch_version)} needs triton {' or '.join(want)}; "
+                   f"a mismatched triton fails inside torch.compile, sometimes silently) — "
+                   f"reinstall with: pip install \"triton-windows>={want[0]}.0,<{float(want[1]) + 0.1:.1f}\"")
+
+
 def has_host_c_compiler(platform: Optional[str] = None) -> bool:
     """POSIX: is a C compiler on PATH? inductor/triton build small host-side stubs with one at
     runtime, so torch.compile without it dies with "Failed to find C compiler" — which is what
@@ -176,17 +219,24 @@ _INT8_PEAK_GB = 16.2
 # Smaller than it looks: the budget is FREE VRAM, which already excludes whatever else is
 # resident, so this only has to cover allocator slack and fragmentation.
 _HEADROOM_GB = 1.5
+# NF4 keeps less: the measured peaks already include the allocator's cached memory, and NF4 cannot
+# swap, so its only fallback is fp8 + swap at ~4x the step time. At 1.5 a 16 GB card with a browser
+# open fell off NF4 at 1 MP although NF4 fits there (13.4 GB peak under a 16 GB cap, previews on).
+_NF4_HEADROOM_GB = 1.0
 
 # Run-shape terms, measured on a 5090 (36-image grid, 28 Jul 2026; whole-GPU peaks minus the
 # ~1 GB desktop baseline; gradient checkpointing on, as the trainers force):
 #   batch      +2.4 GB per extra image — flat across 0.25–1.05 MP, and by far the largest
 #              term (the old single-constant budget's blind spot: batch 2 sailed through the
 #              check and OOM'd).
-#   resolution +0.15 GB from 0.25 → 1.05 MP at batch 1 (checkpointing absorbs it); budgeted
-#              at 0.25 GB/MP for slack.
 #   rank       +0.35 GB from r8 → r32 (~15 MB/rank); bases are measured AT rank 32.
+# Resolution, per base (30 Sep 2026, 5090, full-size photos with buckets at 0.98 MP, rank 8, previews
+# off, whole-GPU above idle): 0.25 → 0.98 MP grew NF4 10.5 → 13.2, INT8 15.1 → 17.7, fp8 17.5 →
+# 22.0 GB. The slopes run from the 0.25 MP bases above to those 1 MP peaks (+ the rank-32 term).
+# The earlier single 0.25 GB/MP ("+0.15 GB, checkpointing absorbs it") planned 1 MP runs 2.5-4 GB
+# light: INT8 on 18-20 GB cards and fp8 + swap everywhere ran out.
 _BATCH_GB_PER_IMAGE = 2.4
-_RES_GB_PER_MP = 0.25
+_RES_GB_PER_MP = {"nf4": 3.0, "int8": 2.6, "fp8": 5.1}
 _RANK_GB_PER_RANK = 0.015
 
 # Block swap: GB of peak removed per swapped block, measured on the real trainer under an
@@ -231,10 +281,13 @@ def _lokr_extra_gb(factor: int) -> float:
 def estimate_krea2_peak(base_gb: float, mp: float = 0.25, batch: int = 1,
                         rank: int = 32, network_type: str = "lora",
                         lokr_factor: int = 8) -> float:
-    """Peak VRAM estimate for a Krea 2 run of this shape (base measured at 0.25 MP, b1, r32)."""
+    """Peak VRAM estimate for a Krea 2 run of this shape (base measured at 0.25 MP, b1, r32). The
+    resolution slope follows the base; an unknown base takes the steepest."""
+    kind = {_NF4_PEAK_GB: "nf4", _INT8_PEAK_GB: "int8", _FP8_PEAK_GB: "fp8"}.get(base_gb)
+    res = _RES_GB_PER_MP[kind] if kind else max(_RES_GB_PER_MP.values())
     return (base_gb
             + _BATCH_GB_PER_IMAGE * max(0, int(batch) - 1)
-            + _RES_GB_PER_MP * max(0.0, float(mp) - 0.25)
+            + res * max(0.0, float(mp) - 0.25)
             + _RANK_GB_PER_RANK * max(0, int(rank) - 32)
             + (_lokr_extra_gb(lokr_factor) if network_type == "lokr" else 0.0))
 
@@ -496,7 +549,7 @@ def recommend_krea2_strategy(vram_gb: Optional[float] = None,
             if force_quant == "nf4":
                 # NF4 cannot block-swap: the weights live in `_nf4_packed`, which the offloader
                 # cannot move, and the trainer force-zeroes blocks_to_swap under 4-bit.
-                fits = need + _HEADROOM_GB <= vram
+                fits = need + _NF4_HEADROOM_GB <= vram
                 return MemoryStrategy(
                     True, 0,
                     f"NF4 4-bit as you set it (~{need:.0f} GB needed, {vram:.1f} GB free)"
@@ -540,7 +593,7 @@ def recommend_krea2_strategy(vram_gb: Optional[float] = None,
             "fastest measured, and ~7x more accurate than NF4 (8-bit vs 4-bit)",
             quant_int8="bf16")
 
-    if caps.bitsandbytes and vram >= _nf4_need + _HEADROOM_GB:
+    if caps.bitsandbytes and vram >= _nf4_need + _NF4_HEADROOM_GB:
         return MemoryStrategy(
             True, 0,
             f"NF4 4-bit, no block swap (~{_nf4_need:.0f} GB needed at this run shape, {vram:.1f} GB free) — "
@@ -637,6 +690,30 @@ def compile_boundary(quant_4bit: bool, quant_int8: str, vram_gb=None, caps=None,
     return "inside"
 
 
+def compile_blocker(blocks_to_swap: int, caps: Optional[Capabilities] = None) -> Optional[str]:
+    """Why Auto must not compile on this machine / run (ROCm, block swap, no or mismatched triton, no host C
+    compiler), or None. Shared by Krea 2's rule (should_compile) and the generic family rule."""
+    caps = caps or detect()
+    if caps.is_rocm:
+        return ("ROCm/HIP PyTorch build — Auto leaves torch.compile off "
+                "(recompiles per bucket shape on HIP; set Compile Blocks to On to override)")
+    if blocks_to_swap:
+        return "block swap is active — swapping moves weights between devices every step, " \
+               "which compiled graphs cannot tolerate"
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return "triton is not installed (pip install triton-windows on Windows)"
+    _ok, _why = triton_matches_torch()
+    if not _ok:
+        return _why
+    if not has_host_c_compiler():
+        return ("no C compiler on this system — inductor/triton build host-side stubs "
+                "with one at runtime (on Debian/Ubuntu: apt install gcc); "
+                "running uncompiled")
+    return None
+
+
 def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
                    blocks_to_swap: int, vram_gb: Optional[float] = None,
                    caps: Optional[Capabilities] = None, mp: float = 0.25,
@@ -651,24 +728,10 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     which is why only the compile gate needs them at this strength.
     """
     caps = caps or detect()
-    if caps.is_rocm:
-        return False, (
-            "ROCm/HIP PyTorch build — Auto leaves torch.compile off "
-            "(recompiles per bucket shape on HIP; set Compile Blocks to On to override)"
-        )
+    _blocked = compile_blocker(blocks_to_swap, caps)
+    if _blocked:
+        return False, _blocked
     vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
-
-    if blocks_to_swap:
-        return False, "block swap is active — swapping moves weights between devices every step, " \
-                      "which compiled graphs cannot tolerate"
-    try:
-        import triton  # noqa: F401
-    except Exception:
-        return False, "triton is not installed (pip install triton-windows on Windows)"
-    if not has_host_c_compiler():
-        return False, ("no C compiler on this system — inductor/triton build host-side stubs "
-                       "with one at runtime (on Debian/Ubuntu: apt install gcc); "
-                       "running uncompiled")
 
     kind = "nf4" if quant_4bit else ("int8" if quant_int8 else None)
     if kind is None:

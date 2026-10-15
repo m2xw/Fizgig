@@ -14,6 +14,7 @@ tokens — the H3 convention. The tokenizer is the Qwen3-VL one Fizgig already b
 Output: [1, L, 5120] bf16, exactly what the DiT's condition_proj expects.
 """
 
+import logging
 import os
 
 import torch
@@ -25,6 +26,8 @@ import torch.nn as nn
 # MemoryEfficientSafeOpen reads each tensor with a plain np.fromfile (no torch mmap-view), which
 # is exactly why every large-model loader (krea2 / klein) uses it. Use it here too.
 from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
+
+logger = logging.getLogger(__name__)
 
 # Derived from the checkpoint tensor shapes (U8 weights are 4-bit-packed: real in-dim = 2x).
 _QWEN3_32B_TRUNC50 = dict(
@@ -294,12 +297,146 @@ def build_reference_tokens(tokenizer, image_processor, caption, images, max_leng
             pixel_values, image_grid_thw)
 
 
+# ─── numbered references (the pack's H3 RefMod Text Encode presentation) ───────────────────
+# ComfyUI's H3 tokenizer (comfy/text_encoders/minimax.py) presents saved references as
+#   image -> "<Picture i>: " <vision block>            (the frame twice in the temporal patch)
+#   audio -> "<Audio j>: "                             (a label only; audio never enters Qwen)
+#   video -> "<Video k>: " then, per 2-frame block, "<t seconds>" <vision block>
+# with its own resize / normalise / patch policy (process_qwen2vl_images with patch 16 and
+# mean/std 0.5 for pictures, process_video_block for the pairs). Mirrored here so a prompt
+# written against Fizgig's numbers means the same thing in ComfyUI.
+QWEN_REF_MIN_PIXELS, QWEN_REF_MAX_PIXELS = 3136, 12845056
+
+
+def reference_patches(frames: torch.Tensor, patch_size: int = 16, temporal_patch_size: int = 2,
+                      merge_size: int = 2, min_pixels: int = QWEN_REF_MIN_PIXELS,
+                      max_pixels: int = QWEN_REF_MAX_PIXELS):
+    """[k, H, W, 3] float in [0, 1], k = 1 (a picture: repeated into the temporal patch) or 2 (a
+    video block) -> (flatten [gh*gw, 3*2*16*16], grid_thw [1, 3] = (1, gh, gw)). ComfyUI's
+    process_qwen2vl_images (k = 1) / process_video_block (k = 2), same arithmetic."""
+    import math
+    x = frames.detach().float().permute(0, 3, 1, 2)                       # [k, 3, H, W]
+    if x.shape[0] == 1:
+        x = x.repeat(temporal_patch_size, 1, 1, 1)
+    assert x.shape[0] == temporal_patch_size, f"a reference block is 1 or 2 frames, got {x.shape[0]}"
+    height, width = int(x.shape[2]), int(x.shape[3])
+    factor = patch_size * merge_size
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    x = torch.nn.functional.interpolate(x, size=(h_bar, w_bar), mode="bilinear", align_corners=False)
+    x = (x - 0.5) / 0.5
+    grid_h, grid_w = h_bar // patch_size, w_bar // patch_size
+    patches = x.reshape(1, temporal_patch_size, 3, grid_h // merge_size, merge_size, patch_size,
+                        grid_w // merge_size, merge_size, patch_size)
+    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+    flatten = patches.reshape(grid_h * grid_w, 3 * temporal_patch_size * patch_size * patch_size)
+    return flatten.contiguous(), torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+
+
+def frame_tensor(frame) -> torch.Tensor:
+    """A PIL image or a [H, W, 3] tensor -> float [H, W, 3] in [0, 1]."""
+    if isinstance(frame, torch.Tensor):
+        t = frame.detach().float()
+        return t / 255.0 if t.max() > 1.0 else t
+    import numpy as np
+    return torch.from_numpy(np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0)
+
+
+def sample_video_frames(frames, reference_fps: float = 24.0):
+    """The pack's 2 fps presentation of a decoded reference video: -> (data [k, H, W, 3],
+    timestamps). Index by timestamp so a non-integer rate does not drift (their maths)."""
+    import math
+    n = len(frames)
+    times = [i / 2 for i in range(math.ceil(n * 2 / float(reference_fps)))] or [0.0]
+    idx = [min(round(t * float(reference_fps)), n - 1) for t in times]
+    data = torch.stack([frame_tensor(frames[i]) for i in idx])
+    return data, times
+
+
+def build_numbered_reference_tokens(tokenizer, caption: str, items, max_length: int = None):
+    """ComfyUI's tokenize_with_weights(minimax_ref_items=…), as ids: items are dicts
+    {"type": "image", "data": frame} / {"type": "video", "data": [T, H, W, 3], "timestamps": […]}
+    / {"type": "audio"}. Returns (input_ids [1, L], token_tags [L], pixel_values or None,
+    image_grid_thw or None) — vision runs (markers included) tagged VIDEO, everything else TEXT."""
+    v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    v_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    img_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    ids, tags, pix, grids = [], [], [], []
+    counters = {"image": 0, "audio": 0, "video": 0}
+
+    def add_text(text):
+        t = tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids.extend(t)
+        tags.extend([TEXT_TAG] * len(t))
+
+    def add_vision(block):
+        flatten, grid = reference_patches(block)
+        n = int(grid[0].prod()) // 4                       # merge_size ** 2
+        run = [v_start] + [img_pad] * n + [v_end]
+        ids.extend(run)
+        tags.extend([VIDEO_TAG] * len(run))
+        pix.append(flatten)
+        grids.append(grid)
+
+    for item in items or []:
+        kind = str(item.get("type", ""))
+        if kind not in counters:
+            raise ValueError(f"reference item type must be image, video or audio, got {kind!r}")
+        counters[kind] += 1
+        if kind == "image":
+            add_text(f"<Picture {counters['image']}>: ")
+            add_vision(frame_tensor(item["data"]).unsqueeze(0))
+        elif kind == "audio":
+            add_text(f"<Audio {counters['audio']}>: ")
+        else:
+            frames = item["data"]
+            frames = torch.stack([frame_tensor(f) for f in frames]) if not isinstance(frames, torch.Tensor) else frame_tensor(frames)
+            timestamps = list(item.get("timestamps") or [i / 2.0 for i in range(int(frames.shape[0]))])
+            if int(frames.shape[0]) % 2 == 1:                 # repeat-pad to the temporal patch of 2
+                frames = torch.cat([frames, frames[-1:]], dim=0)
+                timestamps = timestamps + [timestamps[-1]]
+            add_text(f"<Video {counters['video']}>: ")
+            for i in range(0, int(frames.shape[0]), 2):
+                add_text("<%.1f seconds>" % ((timestamps[i] + timestamps[i + 1]) / 2.0))
+                add_vision(frames[i:i + 2])
+    _tk = dict(add_special_tokens=False)
+    if max_length:
+        _tk.update(truncation=True, max_length=max_length)
+    prompt_ids = tokenizer(caption, **_tk)["input_ids"]
+    ids += prompt_ids
+    tags += [TEXT_TAG] * len(prompt_ids)
+    if not ids:
+        pid = getattr(tokenizer, "pad_token_id", None)
+        ids, tags = [151643 if pid is None else int(pid)], [TEXT_TAG]
+    pixel_values = torch.cat(pix, dim=0) if pix else None
+    grid_thw = torch.cat(grids, dim=0) if grids else None
+    return (torch.tensor([ids], dtype=torch.long), torch.tensor(tags, dtype=torch.long), pixel_values, grid_thw)
+
+
 def qwen3vl_key_map(key: str) -> str:
     """Checkpoint key -> Qwen3VLModel parameter name.
 
     The single-file checkpoint stores the language stack under `model.` and the vision tower
     under `visual.`; Qwen3VLModel wants `language_model.` and `visual.`."""
     return "language_model." + key[len("model."):] if key.startswith("model.") else key
+
+
+def _cfg_attr(cfg, name, default):
+    """A config attribute that lives at the top level (Qwen3Model) or under text_config
+    (Qwen3VLModel — the vision build still runs the text path)."""
+    for cand in (cfg, getattr(cfg, "text_config", None)):
+        v = getattr(cand, name, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    return default
 
 
 class MiniMaxH3TextEncoder:
@@ -326,11 +463,93 @@ class MiniMaxH3TextEncoder:
         tensor either way; a gather is memory-bound and trivial at caption lengths.
 
         Text-only path. The vision build scatters image embeddings into the `<|image_pad|>` slots
-        from input_ids, so it never takes the cpu_embed branch (see load_minimax_h3_te)."""
-        if not self.cpu_embed:
-            return self.model(input_ids=ids.to(self.device)).last_hidden_state
-        emb = self.model.embed_tokens(ids.to("cpu")).to(self.device)
-        return self.model(inputs_embeds=emb).last_hidden_state
+        from input_ids, so it never takes the cpu_embed branch (see load_minimax_h3_te).
+
+        Long sequences on pre-sm_80 GPUs are forwarded in L-chunks (see _plan_chunk): SDPA
+        there falls back to the math backend, which materializes the [B, H, L, L] score tensor
+        per layer — ~800 MiB at L~2400 — and a 12.8 GB nvfp4 TE leaves only ~2.5 GB free on a
+        16 GB card. Chunk k passes the past_key_values from chunk k-1; causal attention makes
+        this EXACT (each query attends to the identical key set of the full forward, in the
+        same single softmax), and right padding from encode_batch() stays safe (a real token
+        only looks left)."""
+        chunk = self._plan_chunk(ids)
+        if chunk is None or chunk >= ids.shape[1]:            # fast path: the original call
+            if not self.cpu_embed:
+                return self.model(input_ids=ids.to(self.device)).last_hidden_state
+            emb = self.model.embed_tokens(ids.to("cpu")).to(self.device)
+            return self.model(inputs_embeds=emb).last_hidden_state
+
+        outs, past = [], None
+        for s in range(0, ids.shape[1], chunk):
+            e = min(s + chunk, ids.shape[1])
+            if self.cpu_embed:
+                kw = dict(inputs_embeds=self.model.embed_tokens(ids[:, s:e].to("cpu")).to(self.device))
+            else:
+                kw = dict(input_ids=ids[:, s:e].to(self.device))
+            kw["use_cache"] = True
+            if past is not None:
+                kw["past_key_values"] = past
+            r = self.model(**kw)
+            past = r.past_key_values
+            outs.append(r.last_hidden_state)
+        return torch.cat(outs, dim=1)                         # [B, L, 5120], as in the full pass
+
+    def _plan_chunk(self, ids):
+        """Prefill chunk size for this forward, or None for the single pass.
+
+        None when: the device is not a CUDA card, the card is sm_80+ (flash / mem-efficient
+        SDPA never materializes the score table — the original single call stands), or the
+        batch is small: B*L^2 <= 1024^2. The per-layer math-SDPA peak is H*(B*L^2) at
+        (2*itemsize + 4) bytes/element — the bf16 score matrix, its mask-add temporary and
+        the fp32 softmax all live at once — so the threshold is a ~1 GB table at H=64,
+        cheap anywhere the encoder itself fits. B*L^2, not L: a batch of short captions is
+        as heavy as one long one (the original `L <= 1024` bail-out skipped the former).
+
+        A chunk size otherwise — the single pass genuinely does NOT fit, measured on the
+        dying card (B=11 L=560, 2.67 GB free): in-flight reached ~1.9 GB before the first
+        fp32 softmax (bf16 scores + mask temporary + dense causal mask + projections +
+        hidden copies), and the 844.00 MiB softmax then OOM'd at 722 MiB free. A plain
+        forward in transformers 4.57 builds no KV cache at all — the working set is the
+        attention temporaries themselves, so there is nothing to drop, only to bound.
+        Chunking bounds the per-layer slice to [B, H, C, L]; C is computed live from the
+        free VRAM (mem_get_info at call time) and the model config: the largest C keeping
+        the slice, priced at (2*itemsize + 4) bytes/element, under
+        (free - KV - MLP - hidden/q overhead - 10% margin). The KV is NOT optional in
+        the chunked path —
+        chunk k attends through past_key_values, that is the exactness mechanism — so it
+        is priced in full. Clamped to [128, 2048]; C >= L collapses to the single pass
+        in _text_forward."""
+        B, L = ids.shape
+        dev = torch.device(self.device)
+        if dev.type != "cuda":
+            return None                                        # non-CUDA: fits anywhere
+        if torch.cuda.get_device_capability(dev.index)[0] >= 8:
+            return None                                        # flash SDPA: original call stands
+        if B * L * L <= 1024 * 1024:
+            return None                                        # small table: single pass is cheap
+        free_b, _ = torch.cuda.mem_get_info(dev.index)
+        cfg = self.model.config
+        heads = _cfg_attr(cfg, "num_attention_heads", 64)
+        itemsize = self.compute_dtype.itemsize                  # bf16 -> 2 bytes
+        kv_heads = _cfg_attr(cfg, "num_key_value_heads", heads)
+        head_dim = _cfg_attr(cfg, "head_dim", _cfg_attr(cfg, "hidden_size", 5120) // heads)
+        layers = _cfg_attr(cfg, "num_hidden_layers", 50)
+        kv = B * kv_heads * L * head_dim * 2 * itemsize * layers          # k+v, bf16, all layers
+        mlp = B * L * _cfg_attr(cfg, "intermediate_size", 0) * itemsize
+        extra = B * L * _cfg_attr(cfg, "hidden_size", 5120) * itemsize * 4       # hidden copies + q proj
+        margin = int(0.10 * free_b)
+        budget = free_b - kv - mlp - extra - margin
+        if budget <= 0:
+            budget = int(0.25 * free_b)                        # pathological: keep some chunk
+        c = max(128, min(2048, budget // max(1, B * heads * L * (2 * itemsize + 4))))
+        if not getattr(self, "_chunk_logged", False):           # one line per process, no spam
+            self._chunk_logged = True
+            logger.info("TE forward: B=%d L=%d single-pass peak ~%.2f GB > %.2f GB free "
+                        "(KV ~%.2f GB) — chunked prefill (C=%d, exact: causal attention "
+                        "over past_key_values)",
+                        B, L, (B * heads * L * L * (2 * itemsize + 4) + kv + mlp) / 2 ** 30,
+                        free_b / 2 ** 30, kv / 2 ** 30, min(c, L))
+        return min(c, L)
 
     def _pad_id(self) -> int:
         """The tokenizer's pad id, or Qwen's default. NOT `pad_token_id or <default>` — a pad id
@@ -396,6 +615,24 @@ class MiniMaxH3TextEncoder:
         # norm is Identity on this build, so last_hidden_state IS the raw layer-50 conditioning
         emb = out.last_hidden_state.to(self.compute_dtype)
         return emb, tags
+
+    @torch.no_grad()
+    def encode_with_items(self, caption: str, items, max_length: int = None):
+        """Numbered references (the pack's Text Encode presentation): pictures, video blocks
+        and audio labels ahead of the caption -> ([1, L, 5120], tags [L]). Vision build only;
+        not memoized (the embedding depends on the frames)."""
+        if not hasattr(self.model, "visual"):
+            raise RuntimeError(
+                "encode_with_items needs the vision-capable encoder — load with "
+                "with_vision=True (build_qwen3vl_te), not the text-only Qwen3Model.")
+        ids, tags, pixel_values, grid = build_numbered_reference_tokens(self.tokenizer, caption, items, max_length)
+        kw = {}
+        if pixel_values is not None:
+            kw["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
+            kw["image_grid_thw"] = grid.to(self.device)
+        out = self.model(input_ids=ids.to(self.device),
+                         attention_mask=torch.ones_like(ids).to(self.device), **kw)
+        return out.last_hidden_state.to(self.compute_dtype), tags
 
     # NO encode_with_reference_batch. Batching the reference encodes was implemented and
     # MEASURED against the one-at-a-time path on the real encoder (tests/diag_ref_batch_encode.py)
