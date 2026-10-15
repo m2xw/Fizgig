@@ -36,5 +36,5 @@ jobs:
           build-args: |
             FIZGIG_IMAGE_VERSION=${{ github.sha }}
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/fizgig:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/fizgig:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/fizgig:${{ github.ref_name }}
