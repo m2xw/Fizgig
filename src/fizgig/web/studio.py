@@ -7,6 +7,7 @@ files, preview checkpoint or speed LoRA, the preview settings) follows the deskt
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -255,8 +256,11 @@ def plan(desc, prefs, pref_path, fast=True, samples=None, negative=None):
     have = lambda k: bool(k and look(k) and os.path.exists(look(k)))
     # a workbench that follows its Samples tab renders where training previews do: the preview checkpoint only while
     # the Samples tab's tick for it is on (every workbench tab plans through here, so they all agree)
-    ck_wanted = not (follow and desc.workbench_checkpoint_follows_tick and samples is not None
-                     and samples.get("checkpoint") is False)
+    on_base = bool(follow and desc.workbench_checkpoint_follows_tick and samples is not None
+                   and samples.get("checkpoint") is False)
+    # the Samples tab on the training model: the checkpoint anyway when the family offers the choice and it's on
+    # "Use the checkpoint" (the default), else the Samples tab's model, with its look LoRA
+    ck_wanted = not on_base or bool(desc.workbench_render_choice and (samples or {}).get("render") != "samples")
     if fast:
         c = desc.preview_checkpoint()
         if ck_wanted and c is not None and have(c[0].pref_key):
@@ -287,6 +291,10 @@ def plan(desc, prefs, pref_path, fast=True, samples=None, negative=None):
           "precision": "int8" if str(prefs.get("inference_int8", "")).strip() in ("1", "True", "true") else "auto",
           "blocks_to_swap": "auto" if swap.lower().startswith("auto") else int(
               "".join(ch for ch in swap.split(" ")[0] if ch.isdigit()) or 0)}
+    lk = desc.preview_look()
+    look_file = str((samples or {}).get("look") or "") if follow and not use_ck else ""
+    if lk is not None and look_file and os.path.isfile(look_file):     # a fixed adapter, like the Turbo LoRA
+        kw.update(look_lora_path=look_file, look_strength=float(desc.preview_look_strength))
     status = f"Loading {desc.display_name} ({ck.name + ', ' if ck else ''}{steps}-step previews)…"
     return kw, settings, status, problems
 
@@ -356,12 +364,13 @@ def render(state, extra=None):
 
 
 def metrics(ref=""):
-    """The desktop's metrics strip for the pair on screen: likeness to a reference photo (ArcFace, the Look Filter's
-    embedder) and repair_studio.metrics' paired numbers - patch grid, face detail, clipping, saturation. CPU only."""
+    """The desktop's metrics strip for the pair on screen: likeness to a reference photo (the Look Filter's face
+    embedder; with Auto look match decided from the reference - ArcFace for a person, DINOv2 for a furry / anime
+    face) and repair_studio.metrics' paired numbers - patch grid, face detail, clipping, saturation. CPU only."""
     import numpy as np
     from PIL import Image
     from fizgig.repair_studio.metrics import PATCH_PITCH, compare
-    from fizgig.web.prep_jobs import _embed, embed_face_box
+    from fizgig.web.prep_jobs import _embed, embed_face_box, session_embedder
     with _lock:
         base_p, tweak_p, fam = _S.get("baseline") or "", _S.get("tweaked") or "", _S.get("family") or ""
     if not (base_p and tweak_p and os.path.isfile(base_p) and os.path.isfile(tweak_p)):
@@ -370,12 +379,15 @@ def metrics(ref=""):
     d = get_family(fam)
     pitch = PATCH_PITCH.get((d.shares_prefs_with or d.key) if d is not None else fam, 16)
     try:
-        b_emb, b_box = embed_face_box(base_p)
-        t_emb, t_box = embed_face_box(tweak_p)
-        ref_emb = _embed(ref) if ref and os.path.isfile(ref) else None
+        has_ref = bool(ref and os.path.isfile(ref))
+        emb, _ = session_embedder([ref] if has_ref else [base_p], log=None)    # one embedder for all three
+        b_emb, b_box = embed_face_box(base_p, emb)
+        t_emb, t_box = embed_face_box(tweak_p, emb)
+        ref_emb = _embed(ref, emb) if has_ref else None
         m = compare(np.array(Image.open(base_p).convert("RGB")), np.array(Image.open(tweak_p).convert("RGB")),
                     pitch, b_box, t_box)
         m["ref_set"], m["ref_face"] = bool(ref), ref_emb is not None
+        m["embedder"], m["like_match"] = emb.label, emb.thresholds["match"]
         m["like_base"] = float(np.dot(ref_emb, b_emb)) if ref_emb is not None and b_emb is not None else None
         m["like_tweak"] = float(np.dot(ref_emb, t_emb)) if ref_emb is not None and t_emb is not None else None
         return {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v) for k, v in m.items()}
@@ -808,14 +820,38 @@ def layout(desc, prefs, pref_path, samples=None):
             # a model that follows its Samples tab: what Studio renders with (the negative only matters above CFG 1)
             "follow_cfg": _num((samples or {}).get("cfg"), 1.0), "follow_steps": str((samples or {}).get("steps") or ""),
             "follow_turbo": (samples or {}).get("turbo_name", "") if (samples or {}).get("turbo_live") else "",
+            # the render choice (description.workbench_render_choice), shown while the Samples tab is on the training
+            # model: "checkpoint" (the default) or "samples"
+            "render_choice": render_choice(desc, prefs, pref_path, samples),
             # a preview checkpoint in use (set in Preferences, its Samples-tab tick on): where Studio renders
             "follow_ck": (f"Previews on the {ck[0].label.split(' (')[0]} - {ck[1].steps} steps, CFG {ck[1].cfg:g}. "
-                          + (f"Untick \"{desc.preview_checkpoint_tick.split(' (')[0]}\" on the Samples tab to preview on "
+                          + ("Follow Samples tab settings (above) renders on the model you train on, as the Samples "
+                             "tab's previews do." if desc.workbench_render_choice and (samples or {}).get("checkpoint", True) is False
+                             else f"Untick \"{desc.preview_checkpoint_tick.split(' (')[0]}\" on the Samples tab to preview on "
                              "the model you train on." if desc.workbench_checkpoint_follows_tick
                              else "Clear it in Preferences to preview with the Samples tab's settings instead."))
-            if ck is not None and have(ck[0].pref_key) and not (desc.workbench_checkpoint_follows_tick and
-                                                                 (samples or {}).get("checkpoint", True) is False)
-            else ""}
+            if ck is not None and have(ck[0].pref_key) and (not (desc.workbench_checkpoint_follows_tick and
+                                                                  (samples or {}).get("checkpoint", True) is False)
+                                                             or (desc.workbench_render_choice and
+                                                                 (samples or {}).get("render") != "samples"))
+            else "",
+            # following the Samples tab on the training model with its look LoRA ticked: said with the rest
+            "follow_look": (f"with the {desc.preview_look().label.split(' (')[0]} at {desc.preview_look_strength:g}"
+                            if desc.preview_look() is not None and (samples or {}).get("look") else "")}
+
+
+def render_choice(desc, prefs, pref_path, samples):
+    """The workbench's render choice (description.workbench_render_choice) while the Samples tab previews on the
+    training model and the preview checkpoint is there: {value ("checkpoint", the default, or "samples"), checkpoint
+    (its option's words), look (the Samples tab's look LoRA is on)}, else None (no choice to show)."""
+    ck = desc.preview_checkpoint()
+    p = pref_path(prefs, ck[0].pref_key) if ck is not None else ""
+    if not (desc.workbench_render_choice and ck is not None and p and os.path.exists(p)
+            and (samples or {}).get("checkpoint", True) is False):
+        return None
+    name = re.sub(r"\s+DiT$", "", ck[0].label.split(" (")[0])
+    return {"value": (samples or {}).get("render") or "checkpoint", "checkpoint": f"Use {name}",
+            "look": bool((samples or {}).get("look"))}
 
 
 def _model_eq(desc, look):

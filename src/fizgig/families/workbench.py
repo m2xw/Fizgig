@@ -42,7 +42,7 @@ from fizgig.families.lora import FamilyLoRA
 
 logger = logging.getLogger(__name__)
 
-PRIMARY, DONOR, SPEED = "primary", "donor", "speed_lora"
+PRIMARY, DONOR, SPEED, LOOK = "primary", "donor", "speed_lora", "preview_look"
 MODEL_EQ_MARKER, MODEL_EQ_GAIN = "ss_fizgig_model_lora", "ss_fizgig_model_lora_gain"
 
 
@@ -63,6 +63,7 @@ def model_eq_gain(path):
 EPOCH = "epoch_"                    # + the epoch number: one adapter per blended epoch (the primary keeps PRIMARY)
 
 from fizgig.families.epochs import _EPOCH_RE, ema_weights, run_epochs   # noqa: F401 (the workbench's own names)
+from fizgig.utils.upright import upright
 
 
 class RenderCancelled(Exception):
@@ -186,13 +187,15 @@ class WorkbenchEngine:
     # ---- models -------------------------------------------------------------------------------------
     def ensure_pipeline(self, dit_path, vae_path, text_encoder_path, speed_lora_path="", device="cuda",
                         lowmem=None, precision="auto", blocks_to_swap=0, preview_sampling=None,
-                        speed_on_checkpoint=False, **_ignored):
+                        speed_on_checkpoint=False, look_lora_path="", look_strength=1.0, **_ignored):
         """Load the DiT (resident) and the VAE once; the text encoder loads per new prompt. speed_lora_path: the
         family's speed LoRA file, attached unmerged and used for every preview ("" = default sampling).
         precision: "auto" = bf16 when the model file fits the free VRAM with 6 GB to spare (Qwen 2.1's 14 GB: 20 GB
         free), else INT8, else NF4 (whichever the family offers); blocks_to_swap streams blocks forward-only
         (previews never backprop). preview_sampling: dit_path is the family's preview checkpoint (a distilled model,
-        description.preview_checkpoint) sampled this way, with no speed LoRA."""
+        description.preview_checkpoint) sampled this way, with no speed LoRA. look_lora_path: the Samples tab's
+        preview look LoRA (MOSS-Image's SFT look), on for every render at look_strength - a fixed adapter like the
+        speed LoRA: never under the block sliders, never in a save."""
         if self.pipeline is not None:
             return
         self.checkpoint_sampling = preview_sampling
@@ -230,6 +233,15 @@ class WorkbenchEngine:
             self.driver.frozen_file_added(self.dit, speed_lora_path, sp.strength, "speed")
             self.speed = sp
             logger.info("%s workbench: speed LoRA %s on %d Linears", self.desc.display_name, sp.name, n)
+        if look_lora_path and os.path.exists(look_lora_path):
+            n = self.net.add_file(look_lora_path, LOOK, float(look_strength))
+            if n:
+                self.net.move_adapter(LOOK, device)
+                self.driver.frozen_file_added(self.dit, look_lora_path, float(look_strength), "speed")
+                logger.info("%s workbench: look LoRA %s on %d Linears at %g", self.desc.display_name,
+                            os.path.basename(look_lora_path), n, float(look_strength))
+            else:
+                self.net.remove(LOOK)
         self.pipeline = _Loaded()
         logger.info("%s workbench ready (%s, block swap %d, lowmem=%s)", self.desc.display_name, precision,
                     self.swapped, self.lowmem)
@@ -535,7 +547,7 @@ class WorkbenchEngine:
         import numpy as np
         from PIL import Image, ImageOps
         with Image.open(path) as im:
-            return np.array(ImageOps.fit(im.convert("RGB"), (int(width), int(height)), Image.LANCZOS))
+            return np.array(ImageOps.fit(upright(im).convert("RGB"), (int(width), int(height)), Image.LANCZOS))
 
     def _reference_latents(self, path, width, height):
         """The edit reference's latents (CPU, batch dim), cached per picture and size."""
@@ -576,7 +588,7 @@ class WorkbenchEngine:
                     if kind == "vision":
                         from PIL import Image
                         with Image.open(ref) as im:
-                            conds = self.driver.encode_text_with_image(te, list(need), im.convert("RGB"),
+                            conds = self.driver.encode_text_with_image(te, list(need), upright(im).convert("RGB"),
                                                                        megapixels=ref_mp)
                     elif kind == "edit":
                         pic = self._fit_reference(ref, *size)

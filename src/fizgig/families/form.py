@@ -51,7 +51,7 @@ DEFAULTS = {
     "FAMILY_DOP_TRIGGER3": "", "FAMILY_DOP_CLASS3": "", "FAMILY_DOP_TRIGGER4": "", "FAMILY_DOP_CLASS4": "",
     "COMPILE_BLOCKS": "Auto", "SAVE_STATE": True,
     "FAMILY_SUBJECTS": "1 subject", "FAMILY_PEOPLE_MODE": "Off - a normal LoRA", "FAMILY_SUBJECT_FIX": False,
-    "FAMILY_MP_MANUAL": False, "FAMILY_SUBJECT_KIND": "From its captions", "FAMILY_SUBJECT_KIND2": "From its captions",
+    "FAMILY_MP_MANUAL": False, "FAMILY_MP_FACECROPS_FIRST": True, "FAMILY_SUBJECT_KIND": "From its captions", "FAMILY_SUBJECT_KIND2": "From its captions",
     "FAMILY_SUBJECT_KIND3": "From its captions", "FAMILY_SUBJECT_KIND4": "From its captions",
     "SAVE_STATE_ON_TRAIN_END": True, "KEEP_LAST_N_STATES": "2", "KREA2_LOSS_WATCH": False,
     "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False, "CAPTION_TRIGGER_WORD": "", "KREA2_WARMUP_LOOK": False,
@@ -344,9 +344,7 @@ def form(desc):
            _row("FAMILY_SUBJECT_KIND3", "Subject 3 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
            _row("FAMILY_CONCEPT_DIR4", "Subject 4", "folder", upload=True, start="data"),
            _row("FAMILY_SUBJECT_KIND4", "Subject 4 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
-           _row("FAMILY_CONCEPT_BALANCE", "Balance the subjects (optional)", "check", "Repeats the smaller folders "
-                "so each subject gets about as many steps an epoch as the largest. Epochs get longer by the repeats.")]
-          if desc.multi_concept else []),
+           ] if desc.multi_concept else []),
         _row("FAMILY_PEOPLE_MODE", "Your subject and other people", "radio", PEOPLE_HINT, PEOPLE_MODES,
              default=PEOPLE_MODES[0], hint_labels=True,           # one line per choice, its name in bold
              sets={PEOPLE_MODES[0]: {"FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False},
@@ -356,9 +354,17 @@ def form(desc):
              "No joining or guessing: Fizgig trains on your captions as they are. Write each subject's joined word "
              "(zwxemwoman) into the captions yourself. The side-by-side pictures and the training recipe stay on.",
              link={"href": GUIDE + "#captioning-it-yourself", "text": "How to caption for this"}),
+        _row("FAMILY_MP_FACECROPS_FIRST", "Side-by-side pictures: face crops first", "check",
+             "The 16 pictures of your subject beside a stranger use Image Prep's face crops (FaceCrop_ files) "
+             "first, then photos where a face is found. Untick to pick from every photo, e.g. for more body "
+             "shape. A face crop is never cropped further; other photos are framed on the face, never zoomed."),
         _row("FAMILY_SUBJECT_FIX", "Correct a trigger word, or what a subject is", "check",
              "Fizgig reads each subject's trigger word, and what they are, from their captions. Tick this only if "
              "the line under a subject shows the wrong word."),
+        # beside the card's other ticks (the tiles flow together): Use my captions, face crops first, Correct a trigger
+        *([_row("FAMILY_CONCEPT_BALANCE", "Balance the subjects (optional)", "check", "Repeats the smaller folders "
+                "so each subject gets about as many steps an epoch as the largest. Epochs get longer by the repeats.")]
+          if desc.multi_concept else []),
         *[r for n in (1, 2, 3, 4) for r in (
             _row("FAMILY_DOP_TRIGGER" + ("" if n == 1 else str(n)), f"Subject {n} - trigger word",
                  hint="The word your captions use for this subject, e.g. zwxem.\n"
@@ -661,6 +667,9 @@ LEGACY_AREAS = {"All Layers": "Full Model", "Identity Blocks": "Identity",
                 "Style+Composition Blocks": "Style+Composition", "Details Blocks": "Details"}
 
 
+SLIDER_PREVIEW_EVERY = "5"           # a Slider preset's preview cadence (apply_preset)
+
+
 def _not_in_preset(k):
     return k.startswith("SAMPLE_") or k in NOT_IN_PRESETS
 
@@ -684,6 +693,10 @@ def apply_preset(desc, values, preset, whole=False):
         p.setdefault("FAMILY_CONCEPT_COUNT", CONCEPT_COUNTS[min(max(len(dirs), 1), len(CONCEPT_COUNTS)) - 1])
     if not whole:
         p = {k: v for k, v in p.items() if not _not_in_preset(k)}
+        # the one Samples box a preset sets: a Slider preset previews its dial every 5 epochs, whatever the model's
+        # own preview default (every epoch is too often for a slider, ACE-Step's 40 too rare)
+        if str(p.get("FAMILY_SLIDER")).lower() in ("true", "1"):
+            p["SAMPLE_EVERY_N_EPOCHS"] = SLIDER_PREVIEW_EVERY
     rows = {r["key"]: r for sec in form(desc)["sections"] for r in sec["rows"] if r}
     for k in STRICT_CHOICES:
         if k in p and k in rows and rows[k].get("choices"):
@@ -861,7 +874,7 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
     if not dop:
         hidden.add("FAMILY_SUBJECT_FIX")
     if not (kind == "standard" and values.get("FAMILY_MULTI_PERSON")):
-        hidden.add("FAMILY_MP_MANUAL")
+        hidden |= {"FAMILY_MP_MANUAL", "FAMILY_MP_FACECROPS_FIRST"}
         hidden |= set(KIND_ROWS)            # what a subject is only changes the group-picture recipe
     if not (dop and values.get("FAMILY_SUBJECT_FIX")):
         hidden |= {"FAMILY_DOP_TRIGGER", "FAMILY_DOP_CLASS"} | DOP_EXTRA_ROWS
